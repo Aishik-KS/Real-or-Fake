@@ -43,6 +43,23 @@ README.md
    python -m pip install transformers pillow numpy opencv-python-headless
    ```
 
+## Download the model
+
+From the project root, install the Hugging Face CLI and download the model directly into the `Model` folder:
+
+```powershell
+python -m pip install -U "huggingface_hub[cli]"
+hf download HauntedFrost/TikTok --repo-type model --local-dir "Model"
+```
+
+This places the downloaded model files in `Model/`, so the checkpoint is saved where the project expects it:
+
+```text
+Model/best_model.pt
+```
+
+Once the download finishes, you can run the model immediately.
+
 ## Run the model
 
 Place the model checkpoint here:
