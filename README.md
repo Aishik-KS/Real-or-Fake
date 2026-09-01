@@ -1,26 +1,16 @@
-# Robust AI-Generated Image Detector 
+# AIGC Image Detector
 
-Detects AI-generated images and **stays accurate after real-world transforms**
-(JPEG, resize, blur, noise, color shift, crop, screenshots, thumbnails). Two frozen
-backbones (CLIP ViT-L/14 + DINOv2 ViT-L) → a small calibrated head, distilled from an
-ensemble into one fast model. real = 0, AIGC = 1.
+This project checks images and returns a confidence score showing how likely
+each image is to be AI-generated.
 
-## Project overview
-- **Model:** CLIP ViT-L/14 + DINOv2 ViT-L (both frozen) fused → MLP head. ~733M params
-  total (~0.9M trainable), **under the 2B limit**. Single `.pt`, single forward pass.
-  The head is **distilled from a v5+v6 ensemble** — the student beat both teachers.
-- **Robustness lever:** train on the six evaluated transforms *plus* compound chains
-  and extreme low-res.
-- **Generalization lever:** train on 13 generator families; hold generators out to
-  *measure* it (unseen-gen AUROC 0.70 → 0.99).
-- **Calibrated output:** temperature scaling; `pred` is a trustworthy P(AIGC) (ECE 0.0005).
-- **Headline:** scored metric (0.5·clean + 0.5·robust) = **0.9867**; independent
-  AI-vs-Real test clean AUROC **0.9986**. Full tables: `3_ROBUSTNESS_SUMMARY.md`.
-
+Docker is not required.
 
 ## Project files
 
 ```text
+.streamlit/
+└── config.toml
+
 Model/
 └── best_model.pt
 
@@ -28,6 +18,7 @@ Test Images/
 └── Images to evaluate
 
 RunModel.py
+WebApp.py
 README.md
 ```
 
@@ -53,32 +44,23 @@ README.md
 
    ```powershell
    python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-   python -m pip install transformers pillow numpy opencv-python-headless
-   python -m venv .venv
-   pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu128
-   pip install -r requirements.txt
-   python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))
-
+   python -m pip install transformers pillow numpy opencv-python-headless streamlit
    ```
 
-## Download the model
+## Run the web interface
 
-From the project root, install the Hugging Face CLI and download the model directly into the `Model` folder:
+Start the local frontend with:
 
 ```powershell
-python -m pip install -U "huggingface_hub[cli]"
-hf download HauntedFrost/TikTok --repo-type model --local-dir "Model"
+python -m streamlit run WebApp.py
 ```
 
-This places the downloaded model files in `Model/`, so the checkpoint is saved where the project expects it:
+The interface opens automatically in your browser. Select images, click
+**Run detection**, view the results, and download `predictions.json`.
 
-```text
-Model/best_model.pt
-```
+Press `Ctrl+C` in the terminal to stop the frontend.
 
-Once the download finishes, you can run the model immediately.
-
-## Run the model
+## Run from the command line
 
 Place the model checkpoint here:
 
@@ -147,26 +129,29 @@ images and your own images separate.
 
 Supported image formats are `.jpg`, `.jpeg`, `.png`, `.bmp`, and `.webp`.
 
-## Limitations & what we'd improve given more time
-- **Extreme low-res tail:** on ~22px thumbnails AUROC dips to ~0.92 (well above chance)
-  — the genuine frontier. We improved it materially over earlier versions (0.58 → 0.83
-  in-dist) via extreme-downscale training; more of it (and a light super-resolution
-  front-end) is the next step.
-- **Specialization ↔ generalization trade:** breadth (13 generators) costs a little on
-  seen-like generators (DDIM 0.982 → 0.928) to generalize far better on unseen ones
-  (Imagen+starGAN 0.70 → 0.996) — the right trade for a real feed, but a real one.
-- **CIFAKE (32px):** all our models score low — a *resolution* domain shift, not a
-  generator failure; reported, not hidden.
-- **Residual false positives** on a few hyper-aesthetic real photos (the "too pretty to
-  be real" boundary); more aesthetic-real training data would chip at it.
-- We treat the detector as a **calibrated triage signal with a human in the loop**, not
-  an oracle. Given more time: broader modern-generator coverage and RINE-style
-  intermediate-layer aggregation.
+## Common errors
 
-  
-## License / credits
-- CLIP (OpenAI) and DINOv2 (Meta) via Hugging Face Transformers.
-- SID_Set (CC-BY-4.0); WildFake (ModelScope); CIFAKE (Kaggle); Unsplash Lite;
-  AI-vs-Real (`Parveshiiii/AI-vs-Real`, test-only).
-- Repo code + trained weights + hyperparameters open-sourced (add an OSS license, e.g.
-  MIT/Apache-2.0, before publishing).
+### `python` is not recognized
+
+Install Python from <https://www.python.org/downloads/> and enable
+**Add Python to PATH** during installation. On Windows, you can also try `py`
+instead of `python`.
+
+### Missing Python package
+
+Run the installation commands in the **Setup in VS Code** section again.
+
+### Model checkpoint not found
+
+Make sure the checkpoint is located at `Model/best_model.pt`.
+
+## GitHub model upload note
+
+`best_model.pt` is approximately 2.94 GB and cannot be uploaded as a normal
+GitHub file. GitHub Team or Enterprise users can store it with Git LFS. On
+GitHub Free or Pro, upload the model to external storage and provide a download
+link. After downloading, place it at:
+
+```text
+Model/best_model.pt
+```

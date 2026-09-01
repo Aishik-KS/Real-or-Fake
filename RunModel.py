@@ -18,6 +18,7 @@ likely to be AIGC-generated.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import sys
 from pathlib import Path
@@ -30,17 +31,6 @@ CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
-
-# Thresholds used only for the human-readable verdict printed to the
-# console. The JSON output always contains the raw probability regardless
-# of these thresholds.
-FAKE_THRESHOLD = 0.5
-UNCERTAIN_BAND = 0.15
-
-# This checkpoint's architecture is fixed (see make_model_class below), so
-# the label shown in the console banner is a constant rather than something
-# read out of the checkpoint's training args.
-ARCHITECTURE_LABEL = "openai/clip-vit-large-patch14 + facebook/dinov2-large"
 
 
 def parse_args() -> argparse.Namespace:
@@ -265,26 +255,100 @@ def output_image_path(path: Path, original_argument: Path, root: Path) -> str:
         return path.as_posix()
 
 
-def verdict_for(probability: float) -> str:
-    """Turn a raw probability into a REAL / AI-GENERATED / UNCERTAIN verdict.
+def load_detector(
+    model_path: Path | None = None,
+    device_choice: str = "auto",
+    script_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Load and return a reusable detector runtime for CLI or frontend use."""
+    base_dir = script_dir or Path(__file__).resolve().parent
+    cv2, np, torch, nn, Image, transformer_types = import_dependencies()
+    checkpoint_path = find_checkpoint(model_path, base_dir)
 
-    This is purely for the console table — the JSON output always records
-    the raw probability, regardless of these thresholds.
-    """
-    if abs(probability - 0.5) <= UNCERTAIN_BAND:
-        return "UNCERTAIN"
-    if probability > FAKE_THRESHOLD:
-        return "AI-GENERATED"
-    return "REAL"
+    if device_choice not in {"auto", "cpu", "cuda"}:
+        raise ValueError(f"Unsupported device choice: {device_choice}")
+    if device_choice == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested, but CUDA is not available.")
+
+    device_name = "cuda" if device_choice == "auto" and torch.cuda.is_available() else device_choice
+    if device_name == "auto":
+        device_name = "cpu"
+    device = torch.device(device_name)
+
+    checkpoint = load_checkpoint(torch, checkpoint_path, device)
+    training_args = checkpoint["args"]
+    if not isinstance(training_args, dict):
+        training_args = vars(training_args)
+    if not training_args.get("hybrid", False):
+        raise RuntimeError("This script expects the hybrid CLIP + DINOv2 checkpoint.")
+
+    model_class = make_model_class(torch, nn, transformer_types)
+    model = model_class(hidden_dim=int(training_args.get("hidden_dim", 512))).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    model.eval()
+
+    temperature = float(checkpoint.get("temperature", 1.0))
+    if temperature <= 0:
+        raise RuntimeError(f"Checkpoint contains invalid temperature: {temperature}")
+
+    # Release the checkpoint container after its tensors have been copied into
+    # the model. This reduces idle memory use in the long-running web frontend.
+    del checkpoint
+    gc.collect()
+
+    return {
+        "cv2": cv2,
+        "np": np,
+        "torch": torch,
+        "Image": Image,
+        "model": model,
+        "temperature": temperature,
+        "device": device,
+        "checkpoint_path": checkpoint_path,
+    }
 
 
-def print_banner() -> None:
-    print()
-    print("=" * 72)
-    print("                 AIGC IMAGE DETECTOR")
-    print("                 REAL vs AI-GENERATED")
-    print("=" * 72)
-    print()
+def predict_images(
+    runtime: dict[str, Any],
+    image_paths: list[Path],
+    display_names: list[str] | None = None,
+    progress_callback: Any | None = None,
+) -> list[dict[str, Any]]:
+    """Predict a list of image paths using an already-loaded detector."""
+    if not image_paths:
+        raise RuntimeError("No images were provided for prediction.")
+    if display_names is not None and len(display_names) != len(image_paths):
+        raise ValueError("display_names must contain one name for every image path.")
+
+    cv2 = runtime["cv2"]
+    np = runtime["np"]
+    torch = runtime["torch"]
+    Image = runtime["Image"]
+    model = runtime["model"]
+    device = runtime["device"]
+    temperature = runtime["temperature"]
+
+    predictions: list[dict[str, Any]] = []
+    with torch.inference_mode():
+        for index, image_path in enumerate(image_paths, start=1):
+            try:
+                batch = preprocess_image(cv2, np, torch, Image, image_path).to(device)
+                logit = model(batch)
+                probability = float(torch.sigmoid(logit.float() / temperature).item())
+            except Exception as exc:
+                raise RuntimeError(f"Could not process image {image_path}: {exc}") from exc
+
+            display_name = display_names[index - 1] if display_names else image_path.as_posix()
+            predictions.append(
+                {
+                    "image_path": display_name,
+                    "pred": round(probability, 6),
+                }
+            )
+            if progress_callback is not None:
+                progress_callback(index, len(image_paths), display_name, probability)
+
+    return predictions
 
 
 def main() -> int:
@@ -292,76 +356,25 @@ def main() -> int:
     script_dir = Path(__file__).resolve().parent
 
     try:
-        cv2, np, torch, nn, Image, transformer_types = import_dependencies()
         checkpoint_path = find_checkpoint(args.model_path, script_dir)
         image_root, image_paths = find_images(args.image_dir)
+        print(f"Loading model: {checkpoint_path}")
+        runtime = load_detector(checkpoint_path, args.device, script_dir)
+        print(f"Scanning {len(image_paths)} image(s) on {runtime['device'].type.upper()}...")
 
-        if args.device == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError("--device cuda was requested, but CUDA is not available.")
-        device_name = "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
-        if device_name == "auto":
-            device_name = "cpu"
-        device = torch.device(device_name)
+        display_names = [
+            output_image_path(path, args.image_dir, image_root) for path in image_paths
+        ]
 
-        print_banner()
-        print("  Loading model...")
+        def print_progress(index: int, total: int, name: str, probability: float) -> None:
+            print(f"[{index:>3}/{total}] {Path(name).name}: {probability:.6f}")
 
-        checkpoint = load_checkpoint(torch, checkpoint_path, device)
-        training_args = checkpoint["args"]
-        if not isinstance(training_args, dict):
-            training_args = vars(training_args)
-        if not training_args.get("hybrid", False):
-            raise RuntimeError("This script expects the hybrid CLIP + DINOv2 checkpoint.")
-
-        model_class = make_model_class(torch, nn, transformer_types)
-        model = model_class(hidden_dim=int(training_args.get("hidden_dim", 512))).to(device)
-        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
-        model.eval()
-        temperature = float(checkpoint.get("temperature", 1.0))
-        if temperature <= 0:
-            raise RuntimeError(f"Checkpoint contains invalid temperature: {temperature}")
-
-        print()
-        print("  MODEL INFORMATION")
-        print("  " + "-" * 68)
-        print(f"  Checkpoint   : {checkpoint_path.name}")
-        print(f"  Architecture : {ARCHITECTURE_LABEL}")
-        print(f"  Device       : {device.type.upper()}")
-        print(f"  Images       : {len(image_paths)}")
-        print()
-        print("=" * 72)
-        print()
-        print("  RUNNING INFERENCE")
-        print()
-        print(f"  {'IMAGE':<30}{'PREDICTION':<18}{'AI SCORE':>10}")
-        print("  " + "-" * 62)
-
-        predictions: list[dict[str, Any]] = []
-        n_real = n_fake = n_uncertain = 0
-        with torch.inference_mode():
-            for image_path in image_paths:
-                try:
-                    batch = preprocess_image(cv2, np, torch, Image, image_path).to(device)
-                    logit = model(batch)
-                    probability = float(torch.sigmoid(logit.float() / temperature).item())
-                except Exception as exc:
-                    raise RuntimeError(f"Could not process image {image_path}: {exc}") from exc
-
-                verdict = verdict_for(probability)
-                if verdict == "REAL":
-                    n_real += 1
-                elif verdict == "AI-GENERATED":
-                    n_fake += 1
-                else:
-                    n_uncertain += 1
-
-                predictions.append(
-                    {
-                        "image_path": output_image_path(image_path, args.image_dir, image_root),
-                        "pred": round(probability, 6),
-                    }
-                )
-                print(f"  {image_path.name:<30}{verdict:<18}{probability * 100:>8.1f}%")
+        predictions = predict_images(
+            runtime,
+            image_paths,
+            display_names=display_names,
+            progress_callback=print_progress,
+        )
 
         output_path = args.output.expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -369,23 +382,7 @@ def main() -> int:
             json.dump(predictions, output_file, indent=2, ensure_ascii=False)
             output_file.write("\n")
 
-        print()
-        print("=" * 72)
-        print("                         RESULTS")
-        print("=" * 72)
-        print()
-        print(f"  Total images      : {len(image_paths)}")
-        print(f"  Real              : {n_real}")
-        print(f"  AI-generated      : {n_fake}")
-        print(f"  Uncertain         : {n_uncertain}")
-        print()
-        print("=" * 72)
-        print()
-        print("  AI SCORE = calibrated probability that the image is AI-generated.")
-        print("  Scores near 50% are treated as uncertain.")
-        print()
-        print(f"  Wrote {len(predictions)} prediction(s) to: {output_path}")
-        print()
+        print(f"Wrote {len(predictions)} prediction(s) to: {output_path}")
         return 0
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
