@@ -47,18 +47,20 @@ README.md
    python -m pip install transformers pillow numpy opencv-python-headless streamlit
    ```
 
-## Run the web interface
+## Running the Web Frontend
 
-Start the local frontend with:
+You can run the interactive web interface locally using Streamlit.
 
-```powershell
-python -m streamlit run WebApp.py
-```
+### 1. Prerequisites & Dependencies
 
-The interface opens automatically in your browser. Select images, click
-**Run detection**, view the results, and download `predictions.json`.
+Ensure you have Python 3.10+ installed and the required dependencies set up:
 
-Press `Ctrl+C` in the terminal to stop the frontend.
+```bash
+# Install PyTorch (CPU version)
+python -m pip install torch --index-url [https://download.pytorch.org/whl/cpu](https://download.pytorch.org/whl/cpu)
+
+# Install frontend and image processing packages
+python -m pip install streamlit transformers pillow numpy opencv-python-headless
 
 ## Run from the command line
 
@@ -116,7 +118,7 @@ Keep the images in any folder and provide its path using `--image_dir`:
 python RunModel.py --image_dir "C:\path\to\images" --output results.json
 ```
 
-### Option 2: Use `Test Images`
+### Option 2: Use `Test Images` via CLI
 
 Copy the images into `Test Images` and run:
 
