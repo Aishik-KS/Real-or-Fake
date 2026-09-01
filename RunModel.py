@@ -27,6 +27,8 @@ from typing import Any
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 IMAGE_SIZE = 224
+REAL_THRESHOLD = 0.35
+AI_THRESHOLD = 0.65
 CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
 CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -255,6 +257,58 @@ def output_image_path(path: Path, original_argument: Path, root: Path) -> str:
         return path.as_posix()
 
 
+def prediction_label(probability: float) -> str:
+    """Convert an AI confidence score into the label used by the CLI and web app."""
+    if probability >= AI_THRESHOLD:
+        return "AI-GENERATED"
+    if probability <= REAL_THRESHOLD:
+        return "REAL"
+    return "UNCERTAIN"
+
+
+def print_information(title: str, fields: list[tuple[str, str]]) -> None:
+    """Print a compact, aligned command-line information section."""
+    print(f"\n{title}")
+    print("-" * len(title))
+    label_width = max(len(label) for label, _ in fields)
+    for label, value in fields:
+        print(f"{label:<{label_width}} : {value}")
+
+
+def shorten_name(name: str, width: int) -> str:
+    """Shorten very long filenames without breaking the table alignment."""
+    if len(name) <= width:
+        return name
+    if width <= 3:
+        return name[:width]
+    return f"{name[:width - 3]}..."
+
+
+def print_prediction_header(name_width: int) -> None:
+    """Print the heading for the live inference results table."""
+    print("\nRUNNING INFERENCE")
+    print("-" * (name_width + 32))
+    print(f"{'IMAGE':<{name_width}}  {'PREDICTION':<14}  {'AI SCORE':>10}")
+    print("-" * (name_width + 32))
+
+
+def print_summary(predictions: list[dict[str, Any]], output_path: Path) -> None:
+    """Print final prediction counts and the saved JSON location."""
+    ai_count = sum(item["pred"] >= AI_THRESHOLD for item in predictions)
+    real_count = sum(item["pred"] <= REAL_THRESHOLD for item in predictions)
+    uncertain_count = len(predictions) - ai_count - real_count
+    print_information(
+        "INFERENCE COMPLETE",
+        [
+            ("Images processed", str(len(predictions))),
+            ("AI-generated", str(ai_count)),
+            ("Real", str(real_count)),
+            ("Uncertain", str(uncertain_count)),
+            ("Predictions JSON", str(output_path)),
+        ],
+    )
+
+
 def load_detector(
     model_path: Path | None = None,
     device_choice: str = "auto",
@@ -358,16 +412,33 @@ def main() -> int:
     try:
         checkpoint_path = find_checkpoint(args.model_path, script_dir)
         image_root, image_paths = find_images(args.image_dir)
-        print(f"Loading model: {checkpoint_path}")
+        print("Loading detector, please wait...")
         runtime = load_detector(checkpoint_path, args.device, script_dir)
-        print(f"Scanning {len(image_paths)} image(s) on {runtime['device'].type.upper()}...")
 
         display_names = [
             output_image_path(path, args.image_dir, image_root) for path in image_paths
         ]
 
+        print_information(
+            "MODEL INFORMATION",
+            [
+                ("Checkpoint", checkpoint_path.name),
+                ("Architecture", "CLIP ViT-L/14 + DINOv2-Large"),
+                ("Device", runtime["device"].type.upper()),
+                ("Images", str(len(image_paths))),
+                ("Image directory", str(image_root)),
+            ],
+        )
+
+        filename_width = max(len(Path(name).name) for name in display_names)
+        name_width = min(max(filename_width, len("IMAGE")), 48)
+        print_prediction_header(name_width)
+
         def print_progress(index: int, total: int, name: str, probability: float) -> None:
-            print(f"[{index:>3}/{total}] {Path(name).name}: {probability:.6f}")
+            del index, total  # The aligned table provides one row per image.
+            filename = shorten_name(Path(name).name, name_width)
+            label = prediction_label(probability)
+            print(f"{filename:<{name_width}}  {label:<14}  {probability:>9.1%}")
 
         predictions = predict_images(
             runtime,
@@ -382,7 +453,7 @@ def main() -> int:
             json.dump(predictions, output_file, indent=2, ensure_ascii=False)
             output_file.write("\n")
 
-        print(f"Wrote {len(predictions)} prediction(s) to: {output_path}")
+        print_summary(predictions, output_path)
         return 0
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
